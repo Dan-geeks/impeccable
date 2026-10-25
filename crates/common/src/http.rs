@@ -142,7 +142,7 @@ const MAX_HEAD_BYTES: u64 = 64 * 1024;
 /// Read one HTTP request from the stream. `max_body` caps the body read; a
 /// body over the cap sets `body_truncated` (the caller answers 413). A body
 /// that ends early (EOF or a read timeout before Content-Length bytes, a
-/// chunked body without its terminating chunk, a malformed chunk size) is
+/// chunked body without its final CRLF, malformed chunk framing) is
 /// not a request: it reads as None and the connection is dropped, so a
 /// handler never acts on part of an upload.
 pub fn read_request(stream: &TcpStream, max_body: usize) -> Option<Request> {
@@ -247,18 +247,21 @@ pub fn read_request(stream: &TcpStream, max_body: usize) -> Option<Request> {
     } else if chunked {
         loop {
             line.clear();
-            if reader.read_line(&mut line).ok()? == 0 {
-                // EOF before the terminating chunk.
+            if reader.read_line(&mut line).ok()? == 0 || !line.ends_with("\r\n") {
+                // EOF before the terminating chunk, or an incomplete size line.
                 return None;
             }
             let size_str = line.trim().split(';').next().unwrap_or("").trim();
             let size = usize::from_str_radix(size_str, 16).ok()?;
             if size == 0 {
-                // trailer + final CRLF
+                // EOF or a timeout is not the blank line that closes the
+                // trailer section: never dispatch an incomplete upload.
                 loop {
                     line.clear();
-                    let n = reader.read_line(&mut line).unwrap_or(0);
-                    if n == 0 || line.trim_end_matches(['\r', '\n']).is_empty() {
+                    if reader.read_line(&mut line).ok()? == 0 || !line.ends_with("\r\n") {
+                        return None;
+                    }
+                    if line == "\r\n" {
                         break;
                     }
                 }
@@ -293,8 +296,10 @@ pub fn read_request(stream: &TcpStream, max_body: usize) -> Option<Request> {
             if eof {
                 return None;
             }
-            line.clear();
-            if reader.read_line(&mut line).ok()? == 0 {
+            // A chunk's data ends with exactly CRLF, not an arbitrary line.
+            let mut delimiter = [0; 2];
+            reader.read_exact(&mut delimiter).ok()?;
+            if delimiter != *b"\r\n" {
                 return None;
             }
         }
@@ -952,6 +957,38 @@ mod tests {
     fn malformed_chunk_size_is_not_a_request() {
         let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n".to_vec();
         assert!(read_raw(raw, 1024 * 1024).is_none());
+    }
+
+    #[test]
+    fn chunked_framing_requires_a_complete_trailer_section() {
+        for body in ["1\r\na\r\n0\r\n", "1\r\na\r\n0\r\nX-Test: value\r\n"] {
+            let raw = format!("POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+            assert!(read_raw(raw.into_bytes(), 1024).is_none(), "accepted {body:?}");
+        }
+    }
+
+    #[test]
+    fn chunked_framing_requires_crlf_between_chunks() {
+        for body in ["1\r\naBAD\r\n0\r\n\r\n", "1\r\na\n0\r\n\r\n", "1\r\na\r"] {
+            let raw = format!("POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+            assert!(read_raw(raw.into_bytes(), 1024).is_none(), "accepted {body:?}");
+        }
+    }
+
+    #[test]
+    fn chunked_framing_requires_crlf_on_metadata_lines() {
+        for body in ["1\na\r\n0\r\n\r\n", "0\r\n\n", "0\r\nX-Test: value\n\r\n"] {
+            let raw = format!("POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+            assert!(read_raw(raw.into_bytes(), 1024).is_none(), "accepted {body:?}");
+        }
+    }
+
+    #[test]
+    fn chunked_framing_accepts_extensions_and_complete_trailers() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n1;name=value\r\na\r\n0\r\nX-Test: value\r\n\r\n";
+        let req = read_raw(raw.to_vec(), 1024).expect("complete chunked request");
+        assert_eq!(req.body, b"a");
+        assert!(!req.body_truncated);
     }
 
     #[test]
